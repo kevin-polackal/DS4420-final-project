@@ -1,0 +1,317 @@
+---
+title: "DS4420 Final Project"
+author: "Kevin Polackal & Pranav Rana"
+date: "12/4/2025"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Data Preprocessing and Time Series Construction
+```{r libraries}
+library(zoo)  
+library(stats) 
+library(TSA) 
+library(ggplot2) 
+library(dplyr) 
+library(lubridate)
+```
+
+```{r}
+# top K products from collaborative filtering results
+top_products <- read.csv('data/top_k_recs.csv')
+top_product_ids <- top_products$product_id
+```
+```{r}
+# contains user_id, product_id, order_number, product_name
+purchases <- read.csv('data/time_aware_filtered_purchases.csv')
+head(purchases)
+
+orders <- read.csv('data/orders.csv')
+head(orders)
+
+# Merge purchases with orders to get temporal information
+purchases_with_time <- purchases %>%
+  left_join(orders, by = c("user_id" = "user_id", "order_number" = "order_number"))
+
+head(purchases_with_time)
+```
+
+```{r}
+purchases_with_time <- purchases_with_time %>%
+  mutate(
+    # Convert order_dow to numeric and create day name
+    day_of_week = as.numeric(order_dow),
+    day_name = case_when(
+      order_dow == 0 ~ "Sunday",
+      order_dow == 1 ~ "Monday", 
+      order_dow == 2 ~ "Tuesday",
+      order_dow == 3 ~ "Wednesday",
+      order_dow == 4 ~ "Thursday",
+      order_dow == 5 ~ "Friday",
+      order_dow == 6 ~ "Saturday",
+      TRUE ~ "Unknown"
+    )
+  )
+
+dow_dist <- purchases_with_time %>%
+  group_by(day_name, day_of_week) %>%
+  summarise(count = n(), .groups = 'drop') %>%
+  arrange(day_of_week)
+print(dow_dist)
+
+```
+
+```{r}
+product_day_counts <- purchases_with_time %>%
+  filter(product_id %in% top_product_ids) %>%
+  group_by(product_id, product_name, day_of_week, day_name) %>%
+  summarise(
+    purchase_count = n(),  
+    .groups = 'drop'
+  ) %>%
+  arrange(product_id, day_of_week)
+
+# Compute product totals and extract product names
+product_totals <- product_day_counts %>%
+  group_by(product_id, product_name) %>%
+  summarise(
+    total_purchase_count = sum(purchase_count),
+    .groups = 'drop'
+  ) %>%
+  arrange(desc(total_purchase_count))
+
+product_names <- product_day_counts %>%
+  select(product_id, product_name) %>%
+  distinct()
+```
+
+```{r}
+all_days <- 0:6
+all_products <- unique(product_day_counts$product_id)
+day_names_map <- data.frame(
+  day_of_week = 0:6,
+  day_name = c("Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday")
+)
+
+complete_ts_by_day <- expand.grid(
+  product_id = all_products,
+  day_of_week = all_days,
+  stringsAsFactors = FALSE
+) %>%
+  left_join(day_names_map, by = "day_of_week") %>%
+  left_join(product_names, by = "product_id") %>%
+  left_join(product_day_counts, by = c("product_id", "day_of_week", "day_name")) %>%
+  mutate(
+    purchase_count = ifelse(is.na(purchase_count), 0, purchase_count),
+    product_name = ifelse(!is.na(product_name.y), product_name.y, product_name.x)
+  ) %>%
+  select(product_id, day_of_week, day_name, product_name, purchase_count) %>%
+  arrange(product_id, day_of_week)
+```
+
+## Exploratory Analysis and Visualization
+```{r visualize-time-series}
+overall_ts_data <- complete_ts_by_day %>%
+  filter(!is.na(product_name)) %>%
+  group_by(day_of_week, day_name) %>%
+  summarise(purchase_count = sum(purchase_count), .groups = 'drop') %>%
+  arrange(day_of_week)
+
+ggplot(overall_ts_data, aes(x = day_of_week, y = purchase_count)) +
+  geom_line() +
+  geom_point() +
+  scale_x_continuous(breaks = 0:6, labels = overall_ts_data$day_name) +
+  ggtitle('Overall Day-of-Week Purchase Pattern (All Top K Products)') +
+  xlab('Day of Week') +
+  ylab('Purchase Count') +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+# With only 7 data points (one per day of week), confidence intervals
+# are not reliable. These plots are for visual inspection only.
+
+acf(overall_ts_data$purchase_count, 
+    main = paste("ACF Plot: Overall Day-of-Week Purchase Pattern (n = 7 days)"),
+    lag.max = 6)
+
+pacf(overall_ts_data$purchase_count, 
+     main = paste("PACF Plot: Overall Day-of-Week Purchase Pattern (n = 7 days)"),
+     lag.max = 6)  
+```
+
+```{r}
+cat("=== Model Selection: Why AR(3)? ===\n\n")
+
+cat("With only 7 data points (one per day of week), the confidence\n")
+cat("intervals in ACF/PACF plots are not reliable. Standard confidence intervals\n")
+cat("assume large sample sizes, so we cannot use them for statistical significance testing.\n\n")
+
+cat("Model Selection Approach:\n")
+cat("  - Given the small sample size, we can use a practical approach:\n")
+cat("  - AR(3) captures dependencies up to 3 days back, which is reasonable for weekly patterns\n")
+cat("  - We fit AR(3) and then check residuals to determine if MA(1) component is needed\n")
+```
+
+## Model Fitting and Forecasting
+
+```{r}
+top_5_products <- product_totals %>%
+  head(5) %>%
+  select(product_id, product_name)
+
+print(top_5_products)
+
+top_product_id <- top_5_products$product_id[1]
+top_product_name <- top_5_products$product_name[1]
+
+product_ts_data <- complete_ts_by_day %>%
+  filter(product_id == top_product_id) %>%
+  filter(!is.na(product_name)) %>%
+  select(day_of_week, purchase_count) %>%
+  arrange(day_of_week) %>%
+  na.omit()
+
+n_cycles <- 10
+ts_values <- rep(product_ts_data$purchase_count, n_cycles)
+ts_index <- 1:length(ts_values)
+```
+
+```{r}
+train_size <- round(0.8 * length(ts_values))
+y_train <- ts_values[1:train_size]
+y_test <- ts_values[(train_size + 1):length(ts_values)]
+
+cat("Training set size:", length(y_train), "\n")
+cat("Test set size:", length(y_test), "\n")
+```
+
+```{r}
+ar_model_3 <- ar(y_train, order.max = 3, aic = FALSE, method = "ols", demean = FALSE)
+
+cat("=== AR(3) Model ===\n")
+cat("Coefficients:", ar_model_3$ar, "\n")
+ar_roots_3 <- polyroot(c(1, -ar_model_3$ar))
+cat("Roots modulus:", Mod(ar_roots_3), "\n")
+cat("Stationary:", all(Mod(ar_roots_3) > 1), "\n")
+```
+
+```{r}
+ar_residuals_3 <- ar_model_3$resid
+acf(ar_residuals_3, na.action = na.pass, 
+    main = "ACF of AR(3) Residuals - Shows Remaining Structure",
+    lag.max = 6)
+cat("We see that the AR(3) shows autocorrelation at lag 3, lets try adding an MA component\n")
+```
+
+```{r}
+n_cycles <- 10
+results_list <- list()
+
+for (i in 1:nrow(top_5_products)) {
+  product_id_loop <- top_5_products$product_id[i]
+  product_name_loop <- top_5_products$product_name[i]
+  
+  product_ts_data_loop <- complete_ts_by_day %>%
+    filter(product_id == product_id_loop) %>%
+    filter(!is.na(product_name)) %>%
+    select(day_of_week, purchase_count) %>%
+    arrange(day_of_week) %>%
+    na.omit()
+  
+  ts_values_loop <- rep(product_ts_data_loop$purchase_count, n_cycles)
+  
+  train_size_loop <- round(0.8 * length(ts_values_loop))
+  y_train_loop <- ts_values_loop[1:train_size_loop]
+  y_test_loop <- ts_values_loop[(train_size_loop + 1):length(ts_values_loop)]
+  
+  arma_model_31_loop <- arima(y_train_loop, order = c(3, 0, 1))
+  
+  pred_arma31_loop <- numeric(length(y_test_loop))
+  current_series_loop <- y_train_loop
+  
+  for (j in 1:length(y_test_loop)) {
+    arma_temp_loop <- tryCatch({
+      arima(current_series_loop, order = c(3, 0, 1))
+    }, error = function(e) {
+      return(arma_model_31_loop)
+    })
+    pred_step_loop <- predict(arma_temp_loop, n.ahead = 1)
+    pred_arma31_loop[j] <- pred_step_loop$pred[1]
+    current_series_loop <- c(current_series_loop, pred_arma31_loop[j])
+  }
+  
+  mae <- mean(abs(y_test_loop - pred_arma31_loop))
+  rmse <- sqrt(mean((y_test_loop - pred_arma31_loop)^2))
+  
+  results_list[[i]] <- data.frame(
+    product_id = product_id_loop,
+    product_name = product_name_loop,
+    mae = mae,
+    rmse = rmse,
+    stringsAsFactors = FALSE
+  )
+
+}
+
+results_df <- do.call(rbind, results_list)
+```
+
+```{r}
+cat("\n=== ARMA(3,1) Results: Top 5 Products ===\n\n")
+print(results_df)
+```
+
+```{r}
+par(mfrow = c(2, 3))
+
+for (i in 1:nrow(top_5_products)) {
+  product_id_plot <- top_5_products$product_id[i]
+  product_name_plot <- top_5_products$product_name[i]
+  
+  product_ts_data_plot <- complete_ts_by_day %>%
+    filter(product_id == product_id_plot) %>%
+    filter(!is.na(product_name)) %>%
+    select(day_of_week, purchase_count) %>%
+    arrange(day_of_week) %>%
+    na.omit()
+  
+  ts_values_plot <- rep(product_ts_data_plot$purchase_count, n_cycles)
+  
+  train_size_plot <- round(0.8 * length(ts_values_plot))
+  y_train_plot <- ts_values_plot[1:train_size_plot]
+  y_test_plot <- ts_values_plot[(train_size_plot + 1):length(ts_values_plot)]
+  test_index_plot <- (train_size_plot + 1):length(ts_values_plot)
+  
+  arma_model_31_plot <- arima(y_train_plot, order = c(3, 0, 1))
+  
+  pred_arma31_plot <- numeric(length(y_test_plot))
+  current_series_plot <- y_train_plot
+  
+  for (j in 1:length(y_test_plot)) {
+    arma_temp_plot <- tryCatch({
+      arima(current_series_plot, order = c(3, 0, 1))
+    }, error = function(e) {
+      return(arma_model_31_plot)
+    })
+    pred_step_plot <- predict(arma_temp_plot, n.ahead = 1)
+    pred_arma31_plot[j] <- pred_step_plot$pred[1]
+    current_series_plot <- c(current_series_plot, pred_arma31_plot[j])
+  }
+  
+  plot(test_index_plot, y_test_plot, type = "l", col = "blue", lwd = 2, 
+       xlab = "Time (Day)", ylab = "Purchase Count", 
+       main = paste("ARMA(3,1):", substr(product_name_plot, 1, 30)),
+       ylim = range(c(y_test_plot, pred_arma31_plot)))
+  lines(test_index_plot, pred_arma31_plot, col = "red", lwd = 2, lty = 2)
+  legend("topleft", legend = c("Actual", "Predicted"), 
+         col = c("blue", "red"), lty = c(1, 2), bty = "n", cex = 0.8)
+}
+
+par(mfrow = c(1, 1))
+```
+
